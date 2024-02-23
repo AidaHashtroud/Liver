@@ -1,0 +1,544 @@
+---
+title: "liver2023"
+---
+
+#Initialisation
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(Rcpp)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(org.Mm.eg.db)
+
+source("/home/hashtroud/Nextcloud/Documents/project/correlation/source/connected_correlation.R")
+source("/home/hashtroud/Nextcloud/Documents/project/correlation/source/ggplot_theme.R")
+
+path.to.annot <- "/home/hashtroud/Nextcloud/Documents/project/annotation"
+path.to.gnnot <- "/home/hashtroud/Nextcloud/Documents/project/annotation/genesets"
+
+path.t0 <- "/transfer/rulands/t0" 
+path.t02 <- "/transfer/rulands/t02" 
+path.t03 <- "/transfer/rulands/t03" 
+path.t05 <- "/transfer/rulands/t05" 
+path.t07 <- "/transfer/rulands/t07" 
+path.t14 <- "/transfer/rulands/t14"
+path.t38 <- "/transfer/rulands/t38"
+path.t90<- "/transfer/rulands/t90"
+path.t92<- "/transfer/rulands/t192"
+
+dir.list <- list( t0 = path.t0,
+                         t02 = path.t02,
+                         t03= path.t03,
+                         t05 = path.t05,
+                         t07 = path.t07,
+                         t14 = path.t14,
+                         t38 = path.t38,
+                          t90= path.t90,
+                          t92= path.t92
+                  )
+qc<- fread("/transfer/rulands/qc_summary.csv")
+meta.data.old <- fread("/transfer/rulands/meta_data.csv") # Already merged with qc
+meta.data<- fread("/home/hashtroud/Nextcloud/Liver regeneration NMT-seq/meta_data.csv") # last modified 26.6.2023
+
+cg.file.list <- lapply(dir.list, function(x) list.files(path=x, full.names = T, pattern = "CpG.cov"))%>%unlist() %>%as.data.table%>%setnames(".","File")%>%.[,File_ID:=word(basename(File),1,sep = ".CpG.cov.gz") ]
+
+gc.file.list <- lapply(dir.list, function(x) list.files(path=x, full.names = T, pattern = "GpC.cov")) %>% unlist%>%as.data.table%>%setnames(".","File")%>%.[,File_ID:=word(basename(File),1,sep = ".GpC.cov.gz") ]
+
+read.files <- function(file){
+  print(file)
+  cov<- fread(file, col.names = c("chr","start","end","perc.methylation","pcounts","ncounts"))%>%
+      .[, .(pcounts = sum(pcounts),
+            ncounts = sum(ncounts)), by=.(chr, start)] %>%
+      .[, end:= start + 1] %>%
+      .[,meth:=pcounts/(ncounts+pcounts)]
+    return(cov)}
+
+get.tiles.meth <- function(cov, tile.list){
+  lapply(tile.list,function(tile) {
+  foverlaps(cov %>% setkey(chr,start,end), tile, mult="all", nomatch = NULL) %>%
+  .[, .( mean.meth = mean(meth),
+         cov = sum(pcounts+ncounts, na.rm=T)), by=.(chr, start, end)]}) %>%
+    rbindlist(idcol="feature")
+}
+
+get.global.meth <- function(tiles.meth) {
+  tiles.meth[,mean(mean.meth),by=feature]
+}
+
+# get.xcorr <- function(cpg.cov, gpc.cov, dist.max = 4e3){
+#   rbindlist(list(cg=cpg.cov, gc=gpc.cov), idcol="type", use.names = T) %>%
+#     .[, rbindlist(list(xcorr_fun(rev(start[type=="gc"]),rev(meth[type=="gc"]), rev(start[type=="cg"]), rev(meth[type=="cg"]), dist_max = dist.max),
+#     xcorr_fun(start[type=="gc"], meth[type=="gc"],  start[type=="cg"], meth[type=="cg"], dist_max= dist.max))), by=.(chr, sample.id)]
+# }
+
+get.xcorr.features <- function(cg.cov, gc.cov, annot.l, dist.max = 2e3){
+  lapply(annot.l, function(x) rbindlist(list(cg=cg.cov, gc=gc.cov), idcol="type", use.names = T) %>%
+      foverlaps( x %>% setkey(chr,start, end), which = F, nomatch = NA, mult ="first") %>%
+      .[, rbindlist(list( xcorr_fun_feature(rev(i.start[type=="cg"]), rev(meth[type="cg"]), 
+                                            rev(i.start[type=="gc"]), rev(meth[type="gc"]),
+                                            rev(!is.na(start) & type=="cg"), dist_max = 2000),
+                          xcorr_fun_feature(i.start[type=="cg"], meth[type=="cg"], 
+                                            i.start[type=="gc"], meth[type=="gc"], 
+                                            !is.na(start) & type=="cg", dist_max= 2000) )), 
+        by=.(chr)] ) %>% rbindlist(idcol="feature")
+}
+
+
+get.mcorr.features<- function(cg.cov, annot.l, dist.max = 2e3){
+  lapply(annot.l, function(x) cg.cov %>%
+      foverlaps( x %>% setkey(chr,start, end), which = F, nomatch = NA, mult ="first") %>%
+        .[, rbindlist(list( corr_fun_feature(rev(i.start), rev(meth),rev(!is.na(start)), dist_max = 2000),
+                          corr_fun_feature(i.start, meth,!is.na(start), dist_max= 2000) )), 
+        by=.(chr)] ) %>% rbindlist(idcol="feature")
+}
+
+get.acorr.features<- function(gc.cov, annot.l, dist.max = 2e3){
+  lapply(annot.l, function(x) gc.cov %>%
+      foverlaps( x %>% setkey(chr,start, end), which = F, nomatch = NA, mult ="first") %>%
+        .[, rbindlist(list( corr_fun_feature(rev(i.start), rev(meth),rev(!is.na(start)), dist_max = 2000),
+                          corr_fun_feature(i.start, meth,!is.na(start), dist_max= 2000) )), 
+        by=.(chr)] ) %>% rbindlist(idcol="feature")
+}
+
+
+
+
+```
+
+# Annotations
+
+```{r}
+tiles <- GenomicRanges::tileGenome(seqlengths = seqinfo(Mmusculus), tilewidth = 10000, cut.last.tile.in.chrom = T) %>% as.data.table() %>% setnames("seqnames", "chr") %>%.[, chr:= factor(gsub("chr","", chr, fixed=T))] %>% setkey(chr,start,end)
+
+annot.files <- list.files(path = "/home/hashtroud/Nextcloud/Documents/project/annotation_features/", full.names = T)
+annot <- lapply(annot.files, function(x) fread(x,col.names = c("chr","start","end")) %>%
+              .[, chr := as.factor(substr(chr,4,6))] %>%setkey(chr, start, end))
+names(annot)<- word(basename(annot.files), sep=stringr::fixed("."))
+
+annot$tiles10kbp <- tiles
+
+```
+
+
+```{r}
+total.ids<- cg.file.list$File_ID
+d <- lapply(total.ids, function(id){
+  
+  print(paste("Processing sample ", id, "..."))
+  cg.cov <- read.files(cg.file.list[File_ID==id, File]) 
+  gc.cov <- read.files(gc.file.list[File_ID==id, File])
+  
+  #if(is.null(cg.cov) || is.null(gc.cov)){
+  if(is.null(gc.cov)){
+
+    message("File not found, skipping...")
+    return(NULL)
+  }
+  
+  setkey(cg.cov, chr, start, end)
+  setkey(gc.cov, chr, start, end)
+  
+  feature.meth.cg <- get.tiles.meth(cg.cov, annot)
+  feature.meth.gc <- get.tiles.meth(gc.cov, annot)
+  global.meth.cg <- get.global.meth(feature.meth.cg)
+  global.meth.gc <- get.global.meth(feature.meth.gc)
+
+  #xcorr.d <- get.xcorr(cg.cov, gc.cov)
+  xcorr.features <- get.xcorr.features(cg.cov, gc.cov, annot)
+  mcorr.features<- get.mcorr.features(cg.cov , annot)
+  acorr.features<- get.acorr.features(gc.cov , annot)
+  
+  return(list(global.meth.cg = global.meth.cg, 
+              global.meth.gc = global.meth.gc,
+              feature.meth.cg = feature.meth.cg,
+              feature.meth.gc = feature.meth.gc,
+              #xcorr.d = xcorr.d,
+              xcorr.features = xcorr.features,
+              mcorr.features= mcorr.features,
+              acorr.features= acorr.features))
+
+})
+names(d) <- total.ids
+d <- d[!sapply(d, is.null)]
+
+saveRDS(d, "/transfer/rulands/liver_data_processed_9092.RData")
+
+
+d_new <- readRDS("/data/biophys/hashtroud/liver/results/liver_data_processed_new.RData")
+```
+
+```{r}
+global.meth.cg <- lapply(d, function(x) x[["global.meth.cg"]]) %>% 
+  rbindlist(idcol="File_ID") %>% setnames("V1", "global.meth")
+
+fwrite(global.meth.cg, "/transfer/rulands/global.meth.cg.9092.txt")
+global.meth.cg.new<- fread("/ssd/rulands/aida/liver_new/global.meth.cg.new.txt")
+
+
+global.meth.gc <- lapply(d, function(x) x[["global.meth.gc"]]) %>% 
+  rbindlist(idcol="File_ID") %>% setnames("V1", "global.access")
+
+
+fwrite(global.meth.gc, "/transfer/rulands/global.meth.gc.9092.txt")
+global.meth.gc.new<- fread("/ssd/rulands/aida/liver_new/global.meth.gc.new.txt")
+
+
+feature.meth.cg <- lapply(d, function(x) x[["feature.meth.cg"]]) %>% 
+  rbindlist(idcol="File_ID") %>% merge(meta.data, by="File_ID")%>% .[PASSED==T]
+
+
+
+feature.meth.cg[, min_meth:=mean(mean.meth, na.rm=T)- std.error(mean.meth) ,by=.(feature, File_ID)]
+feature.meth.cg[, max_meth:=mean(mean.meth, na.rm=T)+ std.error(mean.meth) , by=.(feature, File_ID)]
+
+
+fwrite(feature.meth.cg, "/transfer/rulands/feature.meth.cg.9092.txt")
+feature.meth.cg.new<- fread("/ssd/rulands/aida/liver_new/feature.meth.cg.new.txt")
+
+
+feature.meth.gc <- lapply(d, function(x) x[["feature.meth.gc"]]) %>% 
+  rbindlist(idcol="File_ID") %>% merge(meta.data, by="File_ID")%>% .[PASSED==T]
+
+
+
+feature.meth.gc[, min_access:=mean(mean.meth, na.rm=T)- std.error(mean.meth) ,by=.(feature, File_ID)]
+feature.meth.gc[, max_access:=mean(mean.meth, na.rm=T)+ std.error(mean.meth) , by=.(feature, File_ID)]
+
+
+
+fwrite(feature.meth.gc, "/transfer/rulands/feature.meth.gc.9092.txt")
+feature.meth.gc.new<- fread("/ssd/rulands/aida/liver_new/feature.meth.gc.new.txt")
+ 
+ 
+
+xcorr.features <- lapply(d, function(x) x[["xcorr.features"]]) %>% 
+  rbindlist(idcol="File_ID")%>% merge(meta.data, by="File_ID")%>% .[PASSED==T]
+
+
+fwrite(xcorr.features, "/ssd/rulands/aida/liver_new/xcorr.features.9092.txt")
+xcorr.features.new<- fread("/ssd/rulands/aida/liver_new/xcorr.features.new.txt")
+
+
+corr.acc.features <- lapply(d, function(x) x[["acorr.features"]]) %>% 
+  rbindlist(idcol="File_ID")%>% merge(meta.data, by="File_ID")%>% .[PASSED==T]
+
+fwrite(corr.acc.features, "/transfer/rulands/corr.acc.features.9092.txt")
+corr.acc.features.new<- fread("/ssd/rulands/aida/liver_new/corr.acc.features.new.txt")
+
+
+corr.meth.features <- lapply(d, function(x) x[["mcorr.features"]]) %>% 
+  rbindlist(idcol="File_ID")%>% merge(meta.data, by="File_ID")%>% .[PASSED==T]
+
+fwrite(corr.meth.features, "/transfer/rulands/corr.meth.features.9092.txt")
+corr.meth.features<- fread("/transfer/rulands/corr.meth.features.all.txt")
+```
+
+```{r}
+accessmeth <- merge( global.meth.cg, global.meth.gc) %>% merge(meta.data, by=c("File_ID"))%>% .[PASSED==T]
+
+accessmeth[,median.access.batch.plate:= median(global.access),by= .(Name, Batch, feature) ]
+
+accessmeth[,median.norm.global.access:= global.access/ median.access.batch.plate, by=.(Batch, Time, feature)]
+
+fwrite(accessmeth, "/transfer/rulands/accessmeth_9092.txt")
+accessmeth<- fread("/transfer/rulands/accessmeth_all38.txt")
+```
+
+```{r}
+accessmeth.all38 <- fread("/transfer/rulands/accessmeth_all38.txt")
+accessmeth_total<- rbind(accessmeth.all38, accessmeth)
+
+fwrite(accessmeth_total, "/ssd/rulands/aida/liver_new/accessmeth_total.txt")
+accessmeth_total<- fread("/ssd/rulands/aida/liver_new/accessmeth_total.txt")
+```
+
+
+## Plot methylation and accessibility
+
+```{r}
+
+
+ggplot(accessmeth_total[feature=="tiles10kbp"&Time!="t192"], aes(x=factor(Time), y=global.access))+
+  #, colour=Batch))+
+  geom_boxplot(fill=NA)+
+  # facet_wrap(~feature, nrow = 2)+
+  ggbeeswarm::geom_quasirandom(size=0.2)+
+  theme(aspect.ratio=3/4)+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=1),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  labs( x="Time (day)", y="Global accessibility")
+ggsave("/home/hashtroud/Nextcloud/Liver/figure/globaccess_all90.pdf", width = 5 , height = 2.5 ) 
+
+ggplot(accessmeth_total[feature=="tiles10kbp"&Time!="t192"], aes(x=(Time), y=global.meth))+
+   geom_boxplot(fill=NA)+
+  #facet_wrap(~Name, nrow = 2)+
+  ggbeeswarm::geom_quasirandom(size=0.2)+
+  theme(aspect.ratio=3/4)+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=1),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  labs( x="Time (day)", y="Gelobal methylation")
+ggsave("/home/hashtroud/Nextcloud/Liver/figure/globalmethall90.pdf", width =5 , height = 2.5) 
+
+
+ggplot(accessmeth_total[feature=="tiles10kbp"], aes(x=global.access, y=global.meth, colour= factor(Time)))+
+  facet_wrap(~feature, scales="free_y")+
+  geom_point(alpha=1, size=1)+
+  theme(aspect.ratio=3/4)+
+  labs( x="Norm Accessebility", y="Methylation", colour="Time (day)")
+ggsave("/home/hashtroud/Nextcloud/Liver/figure/TOTALMethylationVsAccessebility_Median_norm_plate_batch_april2023.pdf", width = 15, height = 5)
+
+ggplot(accessmeth, aes(x=median.norm.global.access, colour=factor(Time)))+
+  facet_wrap(~feature, scales="free_y")+
+  stat_bin(aes(y=(..density..)), geom="line", bins=50, position="identity")+
+  labs(x= "Normalised accessibility", y="Probability density", colour="Time")
+  #scale_x_log10()
+ggsave("/home/hashtroud/Nextcloud/Liver/figure/density_april2023.pdf", width = 15, height = 5)
+
+accessmeth[,is.right.outlier := (median.norm.global.access-1)>2*sd(median.norm.global.access-1), by=.(feature, Time)]
+
+ggplot(accessmeth, aes(x=factor(Time), y=1*is.right.outlier))+
+  stat_summary(aes(group=feature),fun=mean)
+```
+
+##Cross-correlation features
+```{r}
+
+annot.cosumm.total<- rbind(annot.cosumm.all38, annot.cosumm)
+
+
+fwrite(annot.cosumm.total, "/ssd/rulands/aida/liver_new/annot.cosumm.total.txt")
+annot.cosumm.total<- fread("/ssd/rulands/aida/liver_new/annot.cosumm.total.txt")
+```
+
+
+```{r}
+annot.cosumm <-xcorr.features%>%
+  merge(accessmeth, by= c("File_ID","feature", "Time", "Batch", "Name")) %>% 
+  .[, .(mcicj = sum(cicj)/sum(n),
+            mci = sum(ci)/sum(n),
+            mcj=sum(cj)/sum(n),
+            n=sum(n)
+    ), by=.(distance, Time, File_ID ,Batch, feature,Name,  median.access.batch.plate)]%>%
+ .[,mcorr := mcicj -mci*mcj]
+
+
+annot.cosumm[, norm.mcorr := mcorr/median.access.batch.plate, by=.(distance ,Time, Batch, feature)]
+
+fwrite(annot.cosumm, "/transfer/rulands/annot.cosumm_all.txt")
+annot.cosumm.all38<- fread("/transfer/rulands/annot.cosumm_all.txt")
+
+ggplot(annot.cosumm.total[Time!="t192"],aes(x=distance, y=norm.mcorr, colour=(Time))) +
+  facet_wrap(~feature, scales="free_y") +
+  stat_summary_bin(bins = 30, fun.data=mean_se, size = 0.5,geom="line")+
+    scale_colour_viridis_d()+
+  scale_fill_viridis_d()+
+  #theme_bw()+
+  theme(aspect.ratio = 3/4)+
+  
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  labs(x="Distance (bp)", y="Cross-correlation", colour="Time(Day)")
+  ggsave("/home/hashtroud/Nextcloud/Liver/figure/Totalcrosscor_till90.pdf", width = 15, height = 5, useDingbats=F)
+  
+  
+ggplot(annot.cosumm[feature=="tiles10kbp" &between(distance, 30, 2000)], aes(x=distance, y=norm.mcorr, colour= factor(Name)))+
+  facet_wrap(~Time)+
+   stat_summary_bin(fun=mean, bins=100, geom = "point")+
+  theme(aspect.ratio=3/4)+
+ xlab("Distance")+ ylab("Cross-Correlation")
+
+  ggsave("/home/hashtroud/Nextcloud/Liver/figure/tile_crosscorr_plate_normedian_april2023.pdf", width = 15, height = 2.5, useDingbats=F)
+  
+ggplot(annot.cosumm[feature=="tiles10kbp" &between(distance, 30, 2000)], aes(x=distance, y=norm.mcorr, colour= factor(Time)))+
+  facet_wrap(~Batch, scales="free_y")+
+   stat_summary_bin(aes(group=Name),fun=mean, bins=100, geom = "point")+
+  theme(aspect.ratio=3/4)+
+ xlab("Distance")+ ylab("Cross-Correlation")
+
+  ggsave("/home/hashtroud/Nextcloud/Liver/figure/tile_crosscorr_batch_normedian_april2023.pdf", width = 10, height = 5, useDingbats=F)
+```
+## Sensitivity of cross-correlation function 
+
+```{r}
+meta.data.rna<- fread("/home/hashtroud/Nextcloud/Liver/CBG-NMT1-3-04corrected_01-06-2023_metadata_cells.csv")
+rna.counts <- fread("/home/hashtroud/Nextcloud/CBG-NMT1-3-04corrected_01-06-2023_count_mat.csv")%>%setnames("V1", "rn")%>%
+  melt(id.vars ="rn",value.name = "expression", variable.name="id_rna") %>%
+    merge(meta.data.integration, by="id_rna")%>%
+    merge(Dna_Name, by="File_DNA")
+
+gene.list <- fread("/data/biophys/hashtroud/CBG_DRS2/Highly_variable_genes.txt") %>% setnames("gene", "gene_id")
+
+
+diff_mcorr <- lapply(gene.list$gene_id, function(x) {
+  tmp <- rna.counts[rn== x]
+  group1 <- tmp[expression <= median(expression), total.id] %>% unique
+  group2 <- tmp[expression > median(expression), total.id]%>% unique
+  return(xcosumm[ distance<1500, (sum(norm.mcorr[total.id %in% group1])/.N) / (sum(norm.mcorr[total.id %in% group2])/.N), by = .(dist.class, DDCday)])
+  })
+names(diff_mcorr)<- gene.list$gene_id
+diff_mcorr <- rbindlist(diff_mcorr, idcol = "gene")
+diff_mcorr[, diff.scaled := scale(V1, center = F), by=.(gene, DDCday)]
+
+feature.order.mat<- data.table::dcast(data=diff_mcorr[ V1!=0& DDCday==0], formula = dist.class~gene, value.var="V1")[,-"dist.class"]
+
+feature.order <- pheatmap::pheatmap(feature.order.mat, cluster_rows = F, cluster_cols = T, scale = "none" ,clustering_distance_cols = "correlation")$tree_col$order
+fo <- data.table(order = 1:length(names(feature.order.mat)), gene=names(feature.order.mat)[feature.order])
+
+
+ggplot(diff_mcorr[dist.class<1500]%>% merge(fo), 
+       aes(x=dist.class, y=reorder(gene,order), fill=V1)) +
+  facet_wrap(~ DDCday)+
+#scale_y_discrete(label = function(x) abbreviate(x,minlength = 30))+
+  geom_raster()+
+  scale_colour_manual(values = c(NA,"black"), guide="none")+
+  scale_fill_gradient2(low = "#2265A4", mid = "white", high = "#AA3082",midpoint = 0, trans="log10")+ #limits=c(-0.02,0.02))+
+  theme(aspect.ratio=1.5, legend.position = "right")+
+  labs(x = "Distance (bp)", y=NULL, fill="Z-score")#
+ggsave("/home/hashtroud/Nextcloud/Liver/figure/sensivity_lowup_ratios_transLog.pdf", width = 15, height = 5, useDingbats=F)
+
+```
+
+##correlation
+```{r}
+annot.cosumm.acc38<-fread("/transfer/rulands/annot.cosumm.acc.all38.txt")
+annot.cosumm.acc.all<-rbind(annot.cosumm.acc38,annot.cosumm.acc)
+```
+
+```{r}
+annot.cosumm.acc <-corr.acc.features%>%
+  merge(accessmeth, by= c("File_ID","feature", "Time", "Batch", "Name")) %>% 
+  .[, .(mcicj = sum(cicj)/sum(n),
+            mci = sum(ci)/sum(n),
+            mcj=sum(cj)/sum(n),
+            n=sum(n)
+    ), by=.(distance, Time, File_ID ,Batch, feature,  median.access.batch.plate)]%>%
+ .[,mcorr := mcicj -mci*mcj]
+
+
+annot.cosumm.acc[, norm.mcorr := mcorr/median.access.batch.plate, by=.(distance ,Time,Batch, feature)]
+
+fwrite(annot.cosumm.meth, "/transfer/rulands/annot.cosumm.meth.all38.txt")
+annot.cosumm.acc.total<- rbind(annot.cosumm.acc, annot.cosumm.acc.new)
+
+get.AB<-  function(xx, corr,mean.meth){
+  model <- y ~ A*mean.meth*exp(-B*x)
+   res <- coef(nlsLM(model, data = data.frame(x=xx, y=corr), start = list(B=0.001, A=0.1) ))
+  #print(res)
+   return(list(AA= res["A"], BB= res["B"]))
+}
+
+annot.cosumm.meth[,B:= get.AB(xx=distance,corr=mcorr,mean.meth = mean.meth )$BB,by=.(feature,Time)]%>%
+  .[,A:= get.AB(xx=distance,corr =mcorr,mean.meth = mean.meth )$AA,by=.(feature,Time)]%>%
+  .[,fitmodel:= A*mean.meth*exp(-B*distance), by=.(feature,Time)]
+
+ggplot(annot.cosumm.acc.all[feature=="tiles10kbp"&Time!="t192"],aes(x=distance, y=mcorr, colour=factor(Time))) +
+  facet_wrap(~Batch, scales="free_y") +
+  stat_summary_bin(fun=mean, bins=30, geom = "line", size=0.7)+
+  #stat_summary_bin(bins=30, fun.data=mean_se, size=0.3)+
+   #geom_line(aes(group=paste(Time,feature), y=fitmodel))+
+  #geom_line(aes(group=paste(Time,feature)), alpha=0.3)+
+  #theme_bw()+
+  #geom_vline(xintercept=1300)+
+  #geom_vline(xintercept=1000)+
+      scale_colour_viridis_d()+
+  scale_fill_viridis_d()+
+  theme(aspect.ratio = 1/1.6)+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.7),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  labs(x="Distance (bp)", y="Autocorrelation accessibility", colour="Time(Day)")
+  
+  ggsave("/transfer/rulands/feature_Atocoracc_all90.pdf", width = 5, height = 3, useDingbats=F)
+  
+  
+  ggplot(annot.cosumm.meth[feature=="tiles10kbp"], aes(x=Time, y=1/B))+
+    geom_point()+
+  #stat_summary_bin(bins=30, fun=mean, geom = "line", linetype="dashed")+
+   #stat_summary_bin(bins=30, fun=mean, geom = "point")+
+  #theme_bw()+
+  theme(aspect.ratio=3/4)+
+  labs(x="Day", y="Length scale", colour="feature")
+  
+  ggplot(cor.wg[distance!=150& Batch%in%c("LAB3392", "LAB3646", "LAB3843", "LAB4065", "LAB4656")],aes(x=factor(Time), y=cor, colour= factor(distance))) +
+  facet_wrap(~Batch, scales="free_y") +
+    geom_point()+
+    geom_line(aes(group= distance))+
+    #stat_summary(aes(group=paste(distance,Time)), fun=mean, geom="point")+
+  #stat_summary_bin(fun=mean, bins=30, geom = "line", size=0.7)+
+  #stat_summary_bin(bins=30, fun.data=mean_se, size=0.3)+
+   #geom_line(aes(group=paste(Time,feature), y=fitmodel))+
+  #geom_line(aes(group=paste(Time,feature)), alpha=0.3)+
+  #theme_bw()+
+  #geom_vline(xintercept=1300)+
+  #geom_vline(xintercept=1000)+
+      scale_colour_viridis_d()+
+  scale_fill_viridis_d()+
+  theme(aspect.ratio = 1/1.6)+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.7),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14))+
+  labs(x="Time(day)", y="Autocorrelation accessibility", colour="Distance(bp)")
+  ggsave("/home/hashtroud/Nextcloud/slowchromatin_Batch.pdf", width = 10, height = 8, useDingbats=F)
+  
+  
+  cor.wg<- annot.cosumm.acc.all[feature=="tiles10kbp"&Time!="t192"]%>%
+    .[distance%in%c("150", "350", "550", "750", "1150")]%>% .[,.(cor=mean(mcorr)), by= .(Time, distance,Batch)]
+ 
+  
+  cor.wg<-cor.wg[between(distance,150,1500 ), dist.class := round(distance/200)*200]%>%
+    .[,cor:=mean(mcorr), by= c("Time", "dist.class")]
+```
+
+```{r}
+setnames(feature.meth.cg.old, c("total.id", "plate_names","DDCday", "batch"), c("File_ID", "Name","Time", "Batch") )
+feature.meth.cg.total<- rbind(feature.meth.cg.old[,.(File_ID, Name,Time, Batch, feature,mean.meth,chr,start,end)], feature.meth.cg[,.(File_ID, Name,Time, Batch, feature,mean.meth,chr,start,end)])
+
+fwrite(feature.meth.cg.total, "/ssd/rulands/aida/liver_new/feature.meth.cg.total.txt")
+feature.meth.cg.total<- fread("/ssd/rulands/aida/liver_new/feature.meth.cg.total.txt")
+
+```
+
+## Differentially methylated regions
+
+```{r}
+accmeth.cor.mon <- feature.meth.cg.total[feature=="tiles10kbp" ,my.cor(mean.meth, Time) ,by=.( chr, start, end)]
+
+#accmeth.cor.tria <-feature.meth.cg[feature=="tiles10kbp",my.cor(mean.meth, dplyr::recode(DDCday,`0`=0,`5`=3,`3`=5)), by=.( chr, start,end)]
+
+acc.meth.cor <- rbindlist(list(monotonic =accmeth.cor.mon), idcol = "type")#, tria = accmeth.cor.tria
+
+acc.meth.cor[,padj := p.adjust(p) ]
+acc.meth.cor[,type := paste(sign(r), type)]
+
+diff.genes <- acc.meth.cor[padj<0.01][,gene := get.nearest.gene(paste0("chr",chr),start, end)]
+
+gsea <- split(diff.genes, diff.genes$type) %>%
+  lapply(., function(x) gost(x$gene, organism = "musmusculus"))
+
+gsea.table<-lapply(gsea, function(x) print(x$result[,c("term_name","source","p_value")]))
+lapply(gsea, function(x) gprofiler2::gostplot(x))
+
+lapply(seq_along(gsea[1]), function(i) ggplot(gsea[[i]]$result %>% as.data.table(key ="p_value") %>% .[! source %in% "TF"] %>% head(20), aes(x=-log10(p_value), y=reorder(term_name, -p_value), fill = source))+
+  geom_col()+
+    #ggtitle(names(gsea)[i])+
+    labs(y="")+
+    theme(aspect.ratio=4)+
+  scale_y_discrete(label = function(x) abbreviate(x,minlength = 50)))
+ggsave(paste0("/home/hashtroud/Nextcloud/Liver/figure/", 11,".pdf"), height=5, width = 15,useDingbats=F)
+
+ggsave("/home/hashtroud/Nextcloud/Liver/figure/gse2023.pdf", width = 8, height = 12, useDingbats=F)
+```
